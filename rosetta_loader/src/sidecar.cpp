@@ -1060,15 +1060,17 @@ uint64_t machThreadId(mach_port_t thread) {
 // One sample: read the thread's ARM pc, resolve it to a guest pc, unwind, and
 // hand the result to the aggregator.  Nothing is accumulated here and nothing is
 // looked up — this thread's only job is to be on time.  `record=false` makes it
-// a discovery probe, which scores a thread without entering the profile.
-void sampleThread(SamplerCtx* ctx, const guest_pc::Reader& reader, guest_pc::Cache& cache,
+// a discovery probe, which scores a thread without entering the profile. The
+// return value says whether thread_get_state succeeded, so sticky mode can tell
+// a dead subject from a live one running outside the discovery range.
+bool sampleThread(SamplerCtx* ctx, const guest_pc::Reader& reader, guest_pc::Cache& cache,
                   mach_port_t thread, uint64_t tid, bool record, bool& inRange) {
     inRange = false;
     arm_thread_state64_t state{};
     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(thread, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state),
                          &count) != KERN_SUCCESS) {
-        return;
+        return false;
     }
     if (record) {
         g_counters.samples.fetch_add(1, std::memory_order_relaxed);
@@ -1184,6 +1186,7 @@ void sampleThread(SamplerCtx* ctx, const guest_pc::Reader& reader, guest_pc::Cac
         g_counters.total_ns.fetch_add(static_cast<uint64_t>((nowUs() - t0) * 1000.0),
                                       std::memory_order_relaxed);
     }
+    return true;
 }
 
 // Everything the profile is made of, owned by one thread: the histograms, the
@@ -1198,6 +1201,7 @@ struct AggCtx {
     double report_s;
     bool unwind;
     bool range_pinned;
+    bool sticky;
     // Per-window delta profiles: how many have been written, and where the one
     // being filled started, in run seconds and in latched seconds.  A window's
     // rate has to divide by the latched time inside THAT window, not the run's.
@@ -1345,6 +1349,7 @@ void emitProfile(FILE* fh, const AggCtx* ctx, const SamplerStats& st, double ela
         rangeFrom = "main image (detected)";
     }
     fprintf(fh, "guest_range_from %s\n", rangeFrom);
+    fprintf(fh, "sticky %s\n", ctx->sticky ? "yes" : "no");
     // A failed latch writes no profile at all, so a profile always has a
     // subject.  `latched_thread` is the CURRENT one, not the only one: a run
     // that re-latched has every thread it followed in [threads], each holding
@@ -1892,6 +1897,11 @@ void* samplerMain(void* raw) {
                 "onto the thread that runs the main image\n",
                 ctx->cfg.path.c_str(), sampleHz, sweepHz);
     }
+    if (ctx->cfg.sticky) {
+        fprintf(stdout,
+                "[rosettax87] X87_SAMPLE: sticky thread sampling enabled; the selected thread "
+                "is kept until its state is unavailable\n");
+    }
     fflush(stdout);
 
     double started = nowUs();
@@ -1903,9 +1913,26 @@ void* samplerMain(void* raw) {
             // Steady state: one thread, one thread_get_state, no task_threads,
             // no port churn and no thread_info.
             bool inRange = false;
-            sampleThread(ctx, reader, cache, latched, latchedTid, true, inRange);
+            const bool stateAvailable =
+                sampleThread(ctx, reader, cache, latched, latchedTid, true, inRange);
             const double now = nowUs();
-            if (inRange) {
+            bool shouldUnlatch = false;
+            if (ctx->cfg.sticky && !stateAvailable) {
+                fprintf(stdout,
+                        "[rosettax87] X87_SAMPLE: unlatched from thread 0x%llx because its "
+                        "state is unavailable; searching again\n",
+                        static_cast<unsigned long long>(latchedTid));
+                fflush(stdout);
+                g_latch.add((now - started) / 1e6,
+                            "unlatched 0x%llx because thread state is unavailable",
+                            static_cast<unsigned long long>(latchedTid));
+                shouldUnlatch = true;
+            } else if (ctx->cfg.sticky) {
+                // Once discovery has found the busiest guest-running thread,
+                // keep following it. The game loop spends most of its time in
+                // DLLs, Rosetta runtime code, syscalls, and waits rather than
+                // inside the launcher's executable image.
+            } else if (inRange) {
                 lastInRange = now;
             } else if (now - lastInRange > kUnlatchAfterS * 1e6) {
                 const double quiet = (now - lastInRange) / 1e6;
@@ -1917,6 +1944,9 @@ void* samplerMain(void* raw) {
                 g_latch.add((now - started) / 1e6,
                             "unlatched 0x%llx after %.1f s outside the image",
                             static_cast<unsigned long long>(latchedTid), quiet);
+                shouldUnlatch = true;
+            }
+            if (shouldUnlatch) {
                 {
                     const std::scoped_lock lock(g_latch.mu);
                     g_latch.latched = false;
@@ -2977,6 +3007,9 @@ void samplerConfigFromEnv(SamplerConfig& cfg) {
     if (const char* w = getenv("X87_SAMPLE_WINDOWS"); w != nullptr && w[0] != '\0') {
         cfg.windows = strcmp(w, "0") != 0;
     }
+    if (env_truthy("X87_SAMPLE_STICKY")) {
+        cfg.sticky = true;
+    }
     if (env_truthy("X87_NO_UNWIND")) {
         cfg.unwind = false;
     }
@@ -3018,6 +3051,19 @@ void unlinkWindowSeries(const std::string& path) {
     closedir(d);
 }
 
+// Several cooperative sidecars can inherit one X87_SAMPLE value from the same
+// launcher.  Expand against the process whose task port we received, not this
+// sidecar's pid, so each profile names the process it actually sampled.
+static std::string expandSamplePid(std::string path, pid_t targetPid) {
+    const std::string replacement = std::to_string(targetPid);
+    size_t offset = 0;
+    while ((offset = path.find("%p", offset)) != std::string::npos) {
+        path.replace(offset, 2, replacement);
+        offset += replacement.size();
+    }
+    return path;
+}
+
 void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const SamplerConfig& in) {
     if (in.path.empty()) {
         return;
@@ -3026,6 +3072,24 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
     // Sweeping every thread faster than the sample rate is never what was
     // meant: the sweep is the expensive mode and the rate is the cheap one.
     cfg.sweep_interval_us = std::max(cfg.sweep_interval_us, cfg.interval_us);
+    if (cfg.guest_range_pinned) {
+        g_counters.guest_lo.store(cfg.guest_lo, std::memory_order_relaxed);
+        g_counters.guest_hi.store(cfg.guest_hi, std::memory_order_relaxed);
+    }
+    // Resolve the target before touching the output path.  Wine starts one
+    // sidecar per i386 process, and all of them inherit the same environment.
+    // Expanding first keeps the injector from truncating the game's profile.
+    pid_t targetPid = 0;
+    if (pid_for_task(parentTaskPort, &targetPid) != KERN_SUCCESS || targetPid <= 0) {
+        if (cfg.path.find("%p") != std::string::npos) {
+            fprintf(stdout,
+                    "[rosettax87] X87_SAMPLE: cannot expand %%p because the target pid is "
+                    "unavailable; sampling disabled\n");
+            return;
+        }
+    } else {
+        cfg.path = expandSamplePid(cfg.path, targetPid);
+    }
     // Nothing from a previous run may survive into this one: a run that never
     // latches writes no profile, and the absence has to be the answer rather
     // than the last run's file still sitting there to be read as this one's.
@@ -3037,10 +3101,6 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
     unlink(cfg.path.c_str());
     unlink((cfg.path + ".windows").c_str());
     unlinkWindowSeries(cfg.path);
-    // The target's pid is needed by both threads and pid_for_task only answers
-    // while it is alive, so it is read here, once, before either starts.
-    pid_t targetPid = 0;
-    pid_for_task(parentTaskPort, &targetPid);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -3069,6 +3129,7 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
                            .report_s = cfg.report_s,
                            .unwind = cfg.unwind,
                            .range_pinned = cfg.guest_range_pinned,
+                           .sticky = cfg.sticky,
                            .windows = cfg.windows};
     pthread_t aggThr;
     if (pthread_create(&aggThr, &attr, aggregatorMain, agg) != 0) {

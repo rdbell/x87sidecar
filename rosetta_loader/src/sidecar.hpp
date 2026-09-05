@@ -55,11 +55,14 @@ void dumpCountersIfEnabled(mach_port_t parentTaskPort);
 // Guest-pc sampler.
 //
 // X87_SAMPLE=<path> enables it and names the profile, exactly like X87_PROFILE.
+// Every `%p` in the path expands to the sampled target's pid.  This matters for
+// launchers such as wine, where several independently wrapped processes inherit
+// the same environment and would otherwise overwrite one another's profile.
 // Everything lands in that one self-describing file: the settings it ran with,
 // which thread it latched onto, the rate it actually achieved, the leaf
 // histogram and the folded stacks.
 struct SamplerConfig {
-    std::string path;  // X87_SAMPLE; empty = disabled
+    std::string path;  // X87_SAMPLE; empty = disabled, `%p` = target pid
     // X87_SAMPLE_HZ, default 10 kHz.  A sample costs ~10 us, so the rate buys
     // resolution at almost exactly 1% of one core per kHz, and it holds: 10 kHz
     // measured 9998 Hz achieved with nothing dropped and the ring under 2% full.
@@ -83,6 +86,12 @@ struct SamplerConfig {
     uint64_t guest_lo = 0;
     uint64_t guest_hi = 0x100000000ULL;
     bool guest_range_pinned = false;
+    // X87_SAMPLE_STICKY. Discovery still chooses the thread seen running guest
+    // code most often, but once chosen the sampler follows it through library
+    // code, Rosetta runtime code, syscalls, and stalls. It re-enters discovery
+    // only when that thread can no longer be read. This is useful for profiling
+    // a long-lived game loop whose executable delegates most work to DLLs.
+    bool sticky = false;
     // Profile rewrite interval, and with it the window size below, which is what
     // sets this rather than durability: every catchable exit path flushes (see
     // flushSamplerIfEnabled), so it bounds only what an uncatchable kill takes
@@ -107,8 +116,9 @@ struct SamplerConfig {
 };
 
 // Overlay X87_SAMPLE / X87_SAMPLE_HZ / X87_SAMPLE_SWEEP_HZ / X87_SAMPLE_REPORT /
-// X87_GUEST_RANGE / X87_NO_UNWIND onto `cfg`.  Env is how the app bundle enables
-// this: gamelauncher passes fixed arguments, but applies its [env] table.
+// X87_GUEST_RANGE / X87_SAMPLE_STICKY / X87_NO_UNWIND onto `cfg`. Env is how the
+// app bundle enables this: gamelauncher passes fixed arguments, but applies its
+// [env] table.
 void samplerConfigFromEnv(SamplerConfig& cfg);
 
 void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const SamplerConfig& in);
