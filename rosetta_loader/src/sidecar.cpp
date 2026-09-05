@@ -2932,14 +2932,48 @@ bool installPortInParent(mach_port_t parentTaskPort, mach_port_t* outServicePort
     return true;
 }
 
+// A launcher can start several independently wrapped processes with the same
+// profiler environment.  Expand against the process whose task port the
+// sidecar received, not the sidecar's own pid, so they cannot truncate one
+// another's output.
+static bool expandTargetPid(std::string& path, pid_t targetPid, const char* variable) {
+    if (path.find("%p") == std::string::npos) {
+        return true;
+    }
+    if (targetPid <= 0) {
+        fprintf(stdout,
+                "[rosettax87] %s: cannot expand %%p because the target pid is unavailable; "
+                "profiling disabled\n",
+                variable);
+        return false;
+    }
+
+    const std::string replacement = std::to_string(targetPid);
+    size_t offset = 0;
+    while ((offset = path.find("%p", offset)) != std::string::npos) {
+        path.replace(offset, 2, replacement);
+        offset += replacement.size();
+    }
+    return true;
+}
+
 bool spawnReceiveThread(mach_port_t servicePort, mach_port_t parentTaskPort) {
     if (g_rosetta_config != nullptr && !g_rosetta_config->profile_path.empty()) {
-        const char* path = g_rosetta_config->profile_path.c_str();
-        g_profile.file = std::fopen(path, "wb");
+        std::string path = g_rosetta_config->profile_path;
+        pid_t targetPid = 0;
+        pid_for_task(parentTaskPort, &targetPid);
+        if (!expandTargetPid(path, targetPid, "X87_PROFILE")) {
+            path.clear();
+        }
+        g_profile.file = path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
         if (g_profile.file == nullptr) {
-            fprintf(stdout, "[rosettax87] X87_PROFILE: failed to open '%s' for writing\n", path);
+            if (!path.empty()) {
+                fprintf(stdout, "[rosettax87] X87_PROFILE: failed to open '%s' for writing\n",
+                        path.c_str());
+            }
         } else {
-            fprintf(stdout, "[rosettax87] X87_PROFILE: dumping IR streams to '%s'\n", path);
+            fprintf(stdout, "[rosettax87] X87_PROFILE: dumping IR streams to '%s'\n",
+                    path.c_str());
         }
         fflush(stdout);
     }
@@ -3051,19 +3085,6 @@ void unlinkWindowSeries(const std::string& path) {
     closedir(d);
 }
 
-// Several cooperative sidecars can inherit one X87_SAMPLE value from the same
-// launcher.  Expand against the process whose task port we received, not this
-// sidecar's pid, so each profile names the process it actually sampled.
-static std::string expandSamplePid(std::string path, pid_t targetPid) {
-    const std::string replacement = std::to_string(targetPid);
-    size_t offset = 0;
-    while ((offset = path.find("%p", offset)) != std::string::npos) {
-        path.replace(offset, 2, replacement);
-        offset += replacement.size();
-    }
-    return path;
-}
-
 void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const SamplerConfig& in) {
     if (in.path.empty()) {
         return;
@@ -3072,23 +3093,12 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
     // Sweeping every thread faster than the sample rate is never what was
     // meant: the sweep is the expensive mode and the rate is the cheap one.
     cfg.sweep_interval_us = std::max(cfg.sweep_interval_us, cfg.interval_us);
-    if (cfg.guest_range_pinned) {
-        g_counters.guest_lo.store(cfg.guest_lo, std::memory_order_relaxed);
-        g_counters.guest_hi.store(cfg.guest_hi, std::memory_order_relaxed);
-    }
-    // Resolve the target before touching the output path.  Wine starts one
-    // sidecar per i386 process, and all of them inherit the same environment.
-    // Expanding first keeps the injector from truncating the game's profile.
+    // The target's pid is needed by both threads and pid_for_task only answers
+    // while it is alive, so read it before touching the output path.
     pid_t targetPid = 0;
-    if (pid_for_task(parentTaskPort, &targetPid) != KERN_SUCCESS || targetPid <= 0) {
-        if (cfg.path.find("%p") != std::string::npos) {
-            fprintf(stdout,
-                    "[rosettax87] X87_SAMPLE: cannot expand %%p because the target pid is "
-                    "unavailable; sampling disabled\n");
-            return;
-        }
-    } else {
-        cfg.path = expandSamplePid(cfg.path, targetPid);
+    pid_for_task(parentTaskPort, &targetPid);
+    if (!expandTargetPid(cfg.path, targetPid, "X87_SAMPLE")) {
+        return;
     }
     // Nothing from a previous run may survive into this one: a run that never
     // latches writes no profile, and the absence has to be the answer rather
@@ -3101,7 +3111,6 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
     unlink(cfg.path.c_str());
     unlink((cfg.path + ".windows").c_str());
     unlinkWindowSeries(cfg.path);
-
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
