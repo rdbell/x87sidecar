@@ -30,6 +30,29 @@ semantics: the two views diverge in both directions. Sharing works only in
 the opposite direction, for pages the sidecar allocates and remaps into the
 tracee, which is exactly how the block profiler's counter array is wired.
 
+## Releasing the default attach stop
+
+The default loader attaches with `PT_ATTACHEXC`, so its stops arrive as
+Mach exceptions. Dropping the ptrace attachment and replying to the held
+exception are separate operations. On macOS 26.6.2 (XNU 12377.161.14), the
+classic sequence successfully detached, but the target stopped again after
+the reply to the synthetic SIGSTOP. The sidecar then waited for the stopped
+target to exit. This reproduced on unchanged master after the CI runner
+moved from macOS 26.5.2 to 26.6.2.
+
+That Tahoe kernel family now uses the same reply-before-detach sequence as
+newer Golden Gate kernels: catch SIGSTOP, hold a Mach task suspend, suppress
+and reply to the signal while still traced, restore exception ports,
+attempt ptrace detach, then balance the task suspend. Older Tahoe builds and early Golden
+Gate kernels retain their existing sequence. The Tahoe cutoff is the
+verified build, not a claim about the first build to change this behavior.
+
+`test_detach_signals` checks that a released target can receive SIGUSR1 in
+its own handler without involving x87 arithmetic. CI also watches the test
+harness for stalled output and captures process state, pipe descriptors and
+stack samples before terminating a stalled invocation. A timeout fails the
+run even if the test PID exited but a sidecar still holds stdout open.
+
 ## Asynchronous signals inside emitted code
 
 When a signal is delivered to a thread that is executing translated code,
@@ -47,16 +70,30 @@ decoder knows, and control flow may only go forward. `FMOV` (scalar,
 immediate), `FCSEL` and inline literal pools (raw data words in the
 instruction stream) are not decodable, and a backward branch is treated as a
 loop and refused. The macOS 27 runtime aborts the process with `failed to
-decode instruction` when it meets one; earlier runtimes resume with part of
-the guest instruction unexecuted, which is what the report saw. Constants are
-therefore materialised through a GPR, a conditional select is a branch over a
-register move, and no emitter branches backwards.
+decode instruction` when it meets one. The original report on an earlier
+runtime lost an x87 addition without that diagnostic. The decoder fix alone
+did not resolve the game crash. Constants are therefore materialised through
+a GPR, a conditional select is a branch over a register move, and no emitter
+branches backwards.
 
 The second is that everything the guest can observe must be in the thread
 context at every map entry. A run of consecutive x87 instructions keeps TOP in
 a register and defers its tag-word and FXCH bookkeeping to the end of the run,
 so a run is answered with one reply: the map then has entries only at the
-run's start and its end, where the state is complete.
+run's start and its end, where the state is complete. This includes the
+register payload format: Rosetta stores physical x87 slots as packed 80-bit
+values at offset `0x06`, stride 10. Its signal-context import/export routines
+copy those fields directly. The sidecar's compact binary64 slots at offset
+`0x08`, stride 8 are private to a reply. The wrapper converts on entry and
+exit, after flushing deferred TOP, tags and permutations.
+
+An opaque save/restore round trip can hide a layout mismatch: the same
+misinterpreted bytes can be copied out and back unchanged. It fails when a
+handler reads or edits the saved registers. `test_x87_signal_context` checks
+the actual native payload at the reported chain's end and replaces it before
+resuming, in both 64-bit and LDT compatibility mode with nested x87 work in
+the handler. `test_x87_native_state` checks all eight FXSAVE/FXRSTOR slots and
+binary64 bit preservation across separate replies, including subnormals.
 
 `tests/test_x87_signal_storm.c` runs the reported chain and one case per x87
 opcode under a SIGUSR1 storm and compares every iteration bit for bit. Stock

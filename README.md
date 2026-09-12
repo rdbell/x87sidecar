@@ -272,12 +272,14 @@ has to get right too. FMA contraction is opt-in (`X87_ENABLE_FMA_CONTRACT=1`) be
 before the add, and at the 53-bit precision Windows processes run at the
 unfused form is the exact one.
 
-The emitted code survives asynchronous signals: when one lands inside a
-translated run, Rosetta steps to the next instruction-map entry and takes
+When an asynchronous signal lands inside a translated run, Rosetta steps to the next instruction-map entry and takes
 the guest state from there, so every instruction the sidecar emits is one
 the runtime's decoder knows, control flow only goes forward, and a run is
 answered with one reply so the map has entries only where the state is
-complete. `tests/test_x87_signal_storm.c` pins this under a SIGUSR1 storm.
+complete. The private binary64 register file is converted to Rosetta's native
+80-bit layout at those boundaries. The signal tests check both arithmetic
+under a SIGUSR1 storm and reading or replacing the saved x87 context in
+64-bit and 32-bit compatibility mode.
 
 Two encodings real hardware runs are missing from Rosetta's decode tables,
 so a program containing them traps under stock Rosetta. A second small stub
@@ -313,7 +315,7 @@ bash scripts/run_tests.sh test_arith     # one test
 bash scripts/run_benchmarks.sh           # build + benchmark table
 ```
 
-The harness runs 89 self-checking x86-64 test binaries under stock Rosetta
+The harness runs 90 self-checking x86-64 test binaries under stock Rosetta
 and then under the sidecar in ten configurations (default, IR off, fusions
 off, hook bypassed, FMA contraction on, clamped register pool, pressure
 relief off, fast rounding, bridging off, bridging v2 off), plus a
@@ -362,6 +364,23 @@ no steady-state cost:
 | `X87_ALWAYS_NONE=1` | the sidecar declines every request; separates a JIT bug from an IPC one |
 | `X87_DISABLE_HOOK=1` | skip the `translate_insn` patch, the benchmark baseline |
 | `X87_NO_DECODE_HOOK=1` | skip the `decode_opcode` patch, so `DC D8` and `ARPL` trap as under stock |
+
+For an execution trace of one IR block, set `X87_TRACE_BLOCK=0xH` and
+optionally `X87_TRACE_OUTPUT=/path/prefix` (default `/tmp/x87trace`). The
+sidecar records native x87 state, ARM X0 through X14, NZCV and FPCR at each
+handled reply's entry and exit. A shared ring retains the last 65,536
+records, with per-thread identity and dropped-reservation reporting.
+It allocates 16 MiB only when the selected block is encountered, and writes
+`<prefix>.<target-pid>.x87trace` at exit. Existing files are never overwritten.
+
+`X87_TRACE_STOP_NEGATIVE=1` freezes and writes the ring when ST(0) is negative
+at a reply ending the selected block. This only freezes the diagnostic
+buffer; the guest continues with the same result. For the CoD2 pitch hash
+`0x129250d0f7976b3f`, `python3 tools/x87_trace_analyze.py capture.x87trace`
+checks complete entry/exit pairs against `2^input` and reports the first
+disagreements. Other hashes are decoded without assuming that invariant.
+Tracing changes execution timing; a clean trace is not proof that the live
+bug is fixed. It does not change stock exclusions or repair recorded values.
 
 Loader and sidecar diagnostics:
 
