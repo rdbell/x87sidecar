@@ -3089,6 +3089,10 @@ void startSampler(mach_port_t parentTaskPort, uint64_t runtimeBase, const Sample
         return;
     }
     SamplerConfig cfg = in;
+    // Pinned ranges bypass main-image discovery, which normally publishes
+    // these counters. Preserve the configured bounds in the profile header.
+    g_counters.guest_lo.store(cfg.guest_lo, std::memory_order_relaxed);
+    g_counters.guest_hi.store(cfg.guest_hi, std::memory_order_relaxed);
     // Sweeping every thread faster than the sample rate is never what was
     // meant: the sweep is the expensive mode and the rate is the cheap one.
     cfg.sweep_interval_us = std::max(cfg.sweep_interval_us, cfg.interval_us);

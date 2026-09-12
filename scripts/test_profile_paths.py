@@ -24,7 +24,8 @@ def check_paths(directory, name):
         path.write_bytes(b"preserve me\n")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("X87_") and key != "STORM_CASE"}
-    env.update(X87_PROFILE=str(profile), X87_SAMPLE_REPORT="0.25")
+    env.update(X87_PROFILE=str(profile), X87_SAMPLE_REPORT="0.25",
+               X87_GUEST_RANGE="0x10000-0x800000000000", X87_SAMPLE_STICKY="1")
     processes = []
     completed = set()
     try:
@@ -53,6 +54,8 @@ def check_paths(directory, name):
             sample_path = Path(f"{sample}.{process.pid}")
             assert block_path.stat().st_size > 0, output
             assert "[leaves]" in sample_path.read_text(), output
+            assert "guest_range 0x10000-0x800000000000\n" in sample_path.read_text(), output
+            assert "sticky yes\n" in sample_path.read_text(), output
             assert "end_window " in Path(f"{sample_path}.windows").read_text(), output
         for path in sentinels:
             assert path.read_bytes() == b"preserve me\n", path
