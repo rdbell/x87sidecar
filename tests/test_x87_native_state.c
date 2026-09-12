@@ -114,9 +114,58 @@ static void test_fxsave_payload(void) {
     failures += bad != 0;
 }
 
+/* Sparse stacks and all TOP rotations must preserve every occupied slot.
+ * Exercise valid, zero and special tags. Empty payload bytes are undefined. */
+static void test_sparse_payloads(void) {
+    unsigned char seed[512] __attribute__((aligned(16)));
+    unsigned char before[512] __attribute__((aligned(16)));
+    unsigned char after[512] __attribute__((aligned(16)));
+    const uint64_t values[8] = {
+        0, 0x8000000000000000ULL, 0x3ff4000000000000ULL, 0xc002000000000000ULL,
+        1, 0x7ff0000000000000ULL, 0xfff0000000000000ULL, 0x7ff8000000000001ULL,
+    };
+    __asm__ volatile(
+        "fninit; fldl 0(%1); fldl 8(%1); fldl 16(%1); fldl 24(%1)\n"
+        "fldl 32(%1); fldl 40(%1); fldl 48(%1); fldl 56(%1); fxsave %0; fninit"
+        : "=m"(seed)
+        : "r"(values)
+        : "memory", "st", "st(1)", "st(2)", "st(3)", "st(4)", "st(5)", "st(6)", "st(7)");
+    int bad = 0;
+    for (unsigned top = 0; top < 8; ++top) {
+        for (unsigned mask = 0; mask < 256; ++mask) {
+            memcpy(before, seed, sizeof(before));
+            uint16_t status;
+            memcpy(&status, before + 2, 2);
+            status = (status & ~0x3800U) | (top << 11);
+            memcpy(before + 2, &status, 2);
+            before[4] = mask;
+            __asm__ volatile("fxrstor %1; fnop; jmp 1f; 1: fnop; fxsave %0; fninit"
+                             : "=m"(after)
+                             : "m"(before)
+                             : "memory", "st", "st(1)", "st(2)", "st(3)", "st(4)", "st(5)", "st(6)",
+                               "st(7)");
+            if (after[4] != mask || ((after[3] >> 3) & 7) != top) {
+                if (bad++ < 5)
+                    printf("FAIL  sparse tags/TOP mask=%02x top=%u\n", mask, top);
+            }
+            for (unsigned slot = 0; slot < 8; ++slot) {
+                if (!(mask & (1U << ((top + slot) & 7))))
+                    continue;
+                if (memcmp(before + 32 + 16 * slot, after + 32 + 16 * slot, 10)) {
+                    if (bad++ < 5)
+                        printf("FAIL  sparse payload mask=%02x top=%u slot=%u\n", mask, top, slot);
+                }
+            }
+        }
+    }
+    printf("%s  native sparse stacks: 256 masks and eight TOP rotations\n", bad ? "FAIL" : "PASS");
+    failures += bad != 0;
+}
+
 int main(void) {
     test_boundary_bits();
     test_extended_rounding();
     test_fxsave_payload();
+    test_sparse_payloads();
     return failures ? 1 : 0;
 }

@@ -95,6 +95,20 @@ resuming, in both 64-bit and LDT compatibility mode with nested x87 work in
 the handler. `test_x87_native_state` checks all eight FXSAVE/FXRSTOR slots and
 binary64 bit preservation across separate replies, including subnormals.
 
+The boundary converter reads the tag word once and collapses it to a bitmap
+of occupied physical slots. It skips empty slots and exits after the final
+occupied slot, shrinking low to high on entry and expanding high to low on
+exit so in-place writes cannot destroy a later source. The bitmap shares
+the low 16 bits of the saved flags register to avoid increasing the seven-GPR
+scratch requirement. Clear those bits before `MSR NZCV`: Rosetta's signal
+stepper rejects bitmap bits in a flags restore. Preserve the entire upper
+half with `0xffff0000`, not just hardware NZCV (`0xf0000000`), because Rosetta
+also stores x86 parity at bit 26. The narrower mask fails FCOMI parity tests.
+All slot checks and exits remain forward branches; replacing them with a
+runtime loop violates the signal decoder rule above. The sparse-state test
+covers every occupancy mask and TOP rotation. Measurements and rejected
+approaches are recorded in [the boundary investigation](native-boundary-performance.md).
+
 `tests/test_x87_signal_storm.c` runs the reported chain and one case per x87
 opcode under a SIGUSR1 storm and compares every iteration bit for bit. Stock
 Rosetta itself shifts the x87 stack when a signal lands in its `fcomp`,

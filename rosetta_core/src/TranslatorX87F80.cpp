@@ -1,5 +1,6 @@
 #include "rosetta_core/TranslatorX87F80.hpp"
 
+#include <array>
 #include <cstdint>
 
 #include "rosetta_core/AssemblerBuffer.h"
@@ -177,11 +178,8 @@ void emit_f80_to_f64_convert(AssemblerBuffer& buf, int Xmant_inout, int Wexp, in
 // All branch displacements are PC-relative (instruction units), so this
 // helper is safe to invoke any number of times back-to-back in one block.
 // =============================================================================
-void emit_f64_to_f80(AssemblerBuffer& buf, int Xaddr_slot, int Dd_src, int Xbits, int Wexp,
-                     int Wd_tmp) {
-    // FMOV Xbits, Dd_src ; raw double bits to GPR
-    emit_fmov_d_to_x(buf, Xbits, Dd_src);
-
+static void emit_f64_bits_to_f80(AssemblerBuffer& buf, int Xaddr_slot, int Xbits, int Wexp,
+                                 int Wd_tmp) {
     // UBFX Xexp, Xbits, #52, #11 ; extract 11-bit exponent
     emit_bitfield(buf, /*is_64bit=*/1, /*opc=*/2, /*N=*/1, /*immr=*/52, /*imms=*/62, Xbits, Wexp);
 
@@ -262,6 +260,12 @@ void emit_f64_to_f80(AssemblerBuffer& buf, int Xaddr_slot, int Dd_src, int Xbits
     emit_str_imm(buf, 1, Wexp, Xaddr_slot, 4);
 }
 
+void emit_f64_to_f80(AssemblerBuffer& buf, int Xaddr_slot, int Dd_src, int Xbits, int Wexp,
+                     int Wd_tmp) {
+    emit_fmov_d_to_x(buf, Xbits, Dd_src);
+    emit_f64_bits_to_f80(buf, Xaddr_slot, Xbits, Wexp, Wd_tmp);
+}
+
 // Rosetta imports/exports physical x87 slots as packed f80 at +6, stride 10.
 // Our emitters use compact doubles at +8, stride 8, only within one reply.
 // Convert in place from low to high when shrinking, high to low when expanding,
@@ -278,22 +282,30 @@ void emit_native_state_boundary(TranslationResult& tr, bool entering) {
     const int sign = alloc_free_gpr(tr);
     const int aux = alloc_free_gpr(tr);
     const int tmp = alloc_free_gpr(tr);
-    const int fp = alloc_free_fpr(tr);
     emit_x87_base(buf, tr, base);
     emit_ldr_str_imm(buf, 1, 0, 1, 2, base, exp);
-    // The empty-stack path leaves NZCV untouched. Adding one to a loaded
-    // halfword sets bit 16 exactly when every tag is empty (0xffff).
-    emit_add_imm(buf, 0, 0, 0, 0, 1, exp, exp);
+    // Invert the tags without touching NZCV: 00 now means empty. Collapse
+    // each pair to its even bit, keeping one live-slot bitmap for the whole
+    // boundary. The payload stores never overlap the tag word at +4.
+    LogicalImmEncoding tags16;
+    is_bitmask_immediate(false, 0xffff, tags16);
+    emit_logical_imm(buf, 0, 2, tags16.N, tags16.immr, tags16.imms, exp, exp);
     const auto empty = buf.end;
-    buf.emit(0x37000000U | (16U << 19) | exp);  // TBNZ Wexp, #16, .done
+    emit_cbz(buf, 0, 0, exp, 0);
     emit_mrs_nzcv(buf, flags);
+    emit_logical_shifted_reg(buf, 0, 1, 0, 1, exp, 1, exp, exp);
+    LogicalImmEncoding even_bits;
+    is_bitmask_immediate(false, 0x55555555, even_bits);
+    emit_and_imm(buf, 0, exp, even_bits.N, even_bits.immr, even_bits.imms, exp);
+    // Keep the bitmap in the unused low 16 bits of the saved flags, then
+    // clear just those bits before MSR. Rosetta also carries parity at bit
+    // 26, so restricting the restore to ARM's hardware NZCV bits loses PF.
+    emit_logical_shifted_reg(buf, 0, 1, 0, 0, exp, 0, flags, flags);
+    std::array<uint64_t, 7> finished;
     for (int j = 0; j < 8; ++j) {
         const int i = entering ? j : 7 - j;
-        emit_ldr_str_imm(buf, 1, 0, 1, 2, base, exp);
-        emit_bitfield(buf, 0, 2, 0, 2 * i, 2 * i + 1, exp, exp);
-        emit_add_imm(buf, 0, 1, 1, 0, 3, exp, 31);
         const auto skip = buf.end;
-        emit_b_cond(buf, 0, 0);
+        buf.emit(0x36000000U | (static_cast<uint32_t>(2 * i) << 19) | flags);
         if (entering) {
             emit_ldur_stur(buf, 3, 1, 6 + 10 * i, base, mant);
             emit_ldr_str_imm(buf, 1, 0, 1, (14 + 10 * i) / 2, base, exp);
@@ -301,14 +313,29 @@ void emit_native_state_boundary(TranslationResult& tr, bool entering) {
             emit_str_imm(buf, 3, mant, base, 1 + i);
         } else {
             emit_add_imm(buf, 1, 0, 0, 0, 6 + 10 * i, base, sign);
-            emit_ldr_str_imm(buf, 3, 1, 1, 1 + i, base, fp);
-            TranslatorX87::emit_f64_to_f80(buf, sign, fp, mant, exp, tmp);
+            emit_ldr_imm(buf, 3, mant, base, 1 + i);
+            emit_f64_bits_to_f80(buf, sign, mant, exp, tmp);
         }
-        buf.data[skip / 4] = 0x54000000U | (static_cast<uint32_t>((buf.end - skip) / 4) << 5);
+        if (j != 7) {
+            // A shallow stack usually has no more live slots. Leave through
+            // the common NZCV restore instead of testing the remaining tags.
+            const uint32_t remaining =
+                entering ? (0xffffU << (2 * (i + 1))) & 0xffffU : (1U << (2 * i)) - 1;
+            LogicalImmEncoding mask;
+            is_bitmask_immediate(false, remaining, mask);
+            emit_and_imm(buf, 0, exp, mask.N, mask.immr, mask.imms, flags);
+            finished[j] = buf.end;
+            emit_cbz(buf, 0, 0, exp, 0);
+        }
+        buf.data[skip / 4] |= static_cast<uint32_t>((buf.end - skip) / 4) << 5;
     }
+    for (const auto branch : finished)
+        buf.data[branch / 4] |= static_cast<uint32_t>((buf.end - branch) / 4) << 5;
+    LogicalImmEncoding nzcv;
+    is_bitmask_immediate(false, 0xffff0000, nzcv);
+    emit_and_imm(buf, 0, flags, nzcv.N, nzcv.immr, nzcv.imms, flags);
     emit_msr_nzcv(buf, flags);
     buf.data[empty / 4] |= static_cast<uint32_t>((buf.end - empty) / 4) << 5;
-    free_fpr(tr, fp);
     tr.free_gpr_mask = saved_mask;
 }
 
