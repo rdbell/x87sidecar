@@ -59,14 +59,14 @@ void dumpCountersIfEnabled(mach_port_t parentTaskPort);
 // Guest-pc sampler.
 //
 // X87_SAMPLE=<path> enables it and names the profile, exactly like X87_PROFILE.
-// Every `%p` in the path expands to the sampled target's pid.  This matters for
+// The target PID is always appended to the configured path. This matters for
 // launchers such as wine, where several independently wrapped processes inherit
 // the same environment and would otherwise overwrite one another's profile.
 // Everything lands in that one self-describing file: the settings it ran with,
 // which thread it latched onto, the rate it actually achieved, the leaf
 // histogram and the folded stacks.
 struct SamplerConfig {
-    std::string path;  // X87_SAMPLE; empty = disabled, `%p` = target pid
+    std::string path;  // X87_SAMPLE; empty = disabled; target PID appended at startup
     // X87_SAMPLE_HZ, default 10 kHz.  A sample costs ~10 us, so the rate buys
     // resolution at almost exactly 1% of one core per kHz, and it holds: 10 kHz
     // measured 9998 Hz achieved with nothing dropped and the ring under 2% full.
