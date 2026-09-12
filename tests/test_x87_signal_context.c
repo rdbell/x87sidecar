@@ -241,9 +241,16 @@ static void run_case(int compat, int rewrite, double x) {
         return;
     }
     double deadline = now() + 0.2;
+    /* A signal must land on the exact finish PC. Under stock translation the
+     * 200 ms window can miss it entirely, especially on a busy host. Give a
+     * coverage-starved case a bounded extension without discarding any bad
+     * state or output observed in the original interval. */
+    double coverage_deadline = deadline + 1.8;
     do {
         run();
-    } while (now() < deadline);
+    } while (now() < deadline ||
+             ((observations == 0 || (rewrite && output.replaced == 0)) &&
+              now() < coverage_deadline));
     atomic_store(&running, 0);
     void* sender_error;
     pthread_join(thread, &sender_error);
