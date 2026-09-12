@@ -268,6 +268,8 @@ void emit_f64_to_f80(AssemblerBuffer& buf, int Xaddr_slot, int Dd_src, int Xbits
 // so a store never overwrites another live source slot. Empty slots have no
 // architectural value and must not be decoded as if they contained f80.
 void emit_native_state_boundary(TranslationResult& tr, bool entering) {
+    // UNSAFE diagnostic control: quantify conversion cost only. Never ship.
+    return;
     const auto saved_mask = tr.free_gpr_mask;
     tr.free_gpr_mask &= kGprScratchMask;
     auto& buf = tr.insn_buf;
